@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/google/go-github/github"
-	"gopkg.in/urfave/cli.v1"
+	cli "gopkg.in/urfave/cli.v1"
 )
 
 func CmdCleanup(c *cli.Context) (err error) {
@@ -60,10 +61,16 @@ func CmdCleanup(c *cli.Context) (err error) {
 
 	for _, name := range toUndeploy {
 		log.Println("Undeploying", name)
-		err := exec.Command(undeployScript, name).Run()
+		err = exec.Command(undeployScript, name).Run()
 		if err != nil {
 			log.Println("undeploy error:", err)
+			continue
 		}
+		pullRequestId, err := strconv.Atoi(name)
+		if err != nil {
+			log.Fatalf("Unable to parse pull request id: %s", name)
+		}
+		destroyGitHubDeployments(ctx, gh, owner, repo, pullRequestId)
 	}
 
 	return nil
@@ -76,4 +83,30 @@ func contains(item string, list []string) bool {
 		}
 	}
 	return false
+}
+
+// destroy deployments related to a PR by marking them
+func destroyGitHubDeployments(ctx context.Context, gh *github.Client, owner string, repo string, pullRequestId int) {
+	pr, _, err := gh.PullRequests.Get(ctx, owner, repo, pullRequestId)
+	if err != nil {
+		log.Fatalf("Unable to fetch from github pull request id: %d", pullRequestId)
+	}
+
+	// Look for an existing deployments
+	// We filter deployments related to a PR based on the PR head branch name (as the `deploy` creates them)
+	deployments, _, err := gh.Repositories.ListDeployments(ctx, owner, repo, &github.DeploymentsListOptions{
+		Ref:  fmt.Sprintf("refs/heads/%s", *pr.Head.Ref),
+		Task: TaskName,
+	})
+	if err != nil || len(deployments) == 0 {
+		log.Println("unable to find deployments related to PR ", pr.ID)
+	}
+	for _, deployment := range deployments {
+		_, _, err := gh.Repositories.CreateDeploymentStatus(ctx, owner, repo, *deployment.ID, &github.DeploymentStatusRequest{
+			State: refString("inactive"),
+		})
+		if err != nil {
+			log.Println("Error while inactivating deployment for PR:", pr.ID)
+		}
+	}
 }
